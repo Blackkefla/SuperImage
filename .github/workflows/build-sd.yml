@@ -1,0 +1,915 @@
+name: Build SD APK
+
+# Compila o SuperImage com Stable Diffusion e publica o APK em Releases.
+# Como usar: aba Actions > "Build SD APK" > Run workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mnn_ref:
+        description: "Branch ou tag do MNN (deixe vazio para a padrao)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Baixar o codigo
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Baixar eigen e os modelos de upscale
+        run: git submodule update --init realesrgan/core/eigen realesrgan/android/src/main/assets
+
+      - name: Trocar o MNN pelo oficial (com suporte a difusao)
+        env:
+          MNN_REF: ${{ inputs.mnn_ref }}
+        run: |
+          rm -rf realesrgan/core/MNN
+          if [ -n "$MNN_REF" ]; then
+            git clone --depth 1 --branch "$MNN_REF" https://github.com/alibaba/MNN realesrgan/core/MNN
+          else
+            git clone --depth 1 https://github.com/alibaba/MNN realesrgan/core/MNN
+          fi
+          H=realesrgan/core/MNN/transformers/diffusion/engine/include/diffusion/diffusion.hpp
+          test -f "$H" || { echo "ERRO: $H nao existe nesta versao do MNN"; exit 1; }
+          grep -q createDiffusion "$H" || { echo "ERRO: API createDiffusion nao encontrada"; exit 1; }
+          git -C realesrgan/core/MNN log -1 --format='MNN commit: %H %cd'
+
+      - name: Aplicar a integracao do Stable Diffusion
+        run: |
+          mkdir -p "$(dirname 'realesrgan/core/diffusion/diffusion_jni.cpp')"
+          cat > 'realesrgan/core/diffusion/diffusion_jni.cpp' <<'SD_EOF_JNI'
+          // Ponte JNI entre o Kotlin (DiffusionEngine) e o runtime de difusão do MNN.
+          // Só compila com suporte real em arm64-v8a; em outras ABIs devolve "não suportado".
+
+          #include <jni.h>
+          #include <android/log.h>
+
+          #include <exception>
+          #include <functional>
+          #include <memory>
+          #include <string>
+
+          #if defined(__aarch64__) || defined(SD_FORCE_SUPPORTED)
+          #define SD_SUPPORTED 1
+          #include "diffusion/diffusion.hpp"
+          #else
+          #define SD_SUPPORTED 0
+          #endif
+
+          #define LOG_TAG "SDJni"
+          #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+          namespace {
+
+          constexpr jint kOk = 0;
+          constexpr jint kInvalidHandle = 1;
+          constexpr jint kLoadFailed = 2;
+          constexpr jint kRunFailed = 3;
+          constexpr jint kException = 4;
+          constexpr jint kUnsupported = 5;
+
+          #if SD_SUPPORTED
+          using MNN::DIFFUSION::Diffusion;
+
+          struct EngineHandle {
+              std::unique_ptr<Diffusion> diffusion;
+              int memoryMode = 0;
+              bool loaded = false;
+          };
+
+          std::string ToString(JNIEnv* env, jstring value) {
+              if (value == nullptr) return {};
+              const char* chars = env->GetStringUTFChars(value, nullptr);
+              std::string result(chars != nullptr ? chars : "");
+              if (chars != nullptr) env->ReleaseStringUTFChars(value, chars);
+              return result;
+          }
+          #endif
+
+          }  // namespace
+
+          extern "C" {
+
+          // backend: 0 = CPU, 3 = OpenCL. memoryMode: 0 = economiza RAM, 1 = rápido (usa mais RAM), 2 = equilibrado.
+          JNIEXPORT jlong JNICALL
+          Java_com_zhenxiang_realesrgan_DiffusionEngine_nativeCreate(JNIEnv* env, jobject /*thiz*/, jstring modelDir,
+                                                                    jint backend, jint memoryMode) {
+          #if SD_SUPPORTED
+              try {
+                  const auto path = ToString(env, modelDir);
+                  const MNNForwardType type = (backend == 3) ? MNN_FORWARD_OPENCL : MNN_FORWARD_CPU;
+                  auto* engine = new EngineHandle();
+                  engine->memoryMode = memoryMode;
+                  engine->diffusion.reset(
+                      Diffusion::createDiffusion(path, MNN::DIFFUSION::STABLE_DIFFUSION_1_5, type, memoryMode));
+                  if (!engine->diffusion) {
+                      delete engine;
+                      return 0;
+                  }
+                  return reinterpret_cast<jlong>(engine);
+              } catch (const std::exception& e) {
+                  LOGE("nativeCreate: %s", e.what());
+                  return 0;
+              }
+          #else
+              (void)env; (void)modelDir; (void)backend; (void)memoryMode;
+              return 0;
+          #endif
+          }
+
+          JNIEXPORT jint JNICALL
+          Java_com_zhenxiang_realesrgan_DiffusionEngine_nativeGenerate(JNIEnv* env, jobject /*thiz*/, jlong handle,
+                                                                      jstring prompt, jstring outputPath, jint steps,
+                                                                      jint seed, jobject listener) {
+          #if SD_SUPPORTED
+              auto* engine = reinterpret_cast<EngineHandle*>(handle);
+              if (engine == nullptr || !engine->diffusion) return kInvalidHandle;
+
+              try {
+                  // Nos modos 0 e 2 o MNN libera os módulos ao fim de cada geração,
+                  // então é preciso chamar load() de novo antes de cada run().
+                  if (!engine->loaded) {
+                      if (!engine->diffusion->load()) return kLoadFailed;
+                      engine->loaded = true;
+                  }
+
+                  jmethodID onProgress = nullptr;
+                  if (listener != nullptr) {
+                      jclass cls = env->FindClass("com/zhenxiang/realesrgan/DiffusionEngine$ProgressListener");
+                      if (cls != nullptr) {
+                          onProgress = env->GetMethodID(cls, "onProgress", "(I)V");
+                          env->DeleteLocalRef(cls);
+                      }
+                      if (env->ExceptionCheck()) env->ExceptionClear();
+                  }
+
+                  std::function<void(int)> progress = [&](int percent) {
+                      if (listener != nullptr && onProgress != nullptr) {
+                          env->CallVoidMethod(listener, onProgress, static_cast<jint>(percent));
+                          if (env->ExceptionCheck()) env->ExceptionClear();
+                      }
+                  };
+
+                  const std::string promptText = ToString(env, prompt);
+                  const std::string outPath = ToString(env, outputPath);
+                  const bool ok = engine->diffusion->run(promptText, outPath, steps, seed, progress);
+
+                  if (engine->memoryMode != 1) engine->loaded = false;
+                  return ok ? kOk : kRunFailed;
+              } catch (const std::exception& e) {
+                  LOGE("nativeGenerate: %s", e.what());
+                  engine->loaded = false;
+                  return kException;
+              }
+          #else
+              (void)env; (void)handle; (void)prompt; (void)outputPath; (void)steps; (void)seed; (void)listener;
+              return kUnsupported;
+          #endif
+          }
+
+          JNIEXPORT void JNICALL
+          Java_com_zhenxiang_realesrgan_DiffusionEngine_nativeRelease(JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
+          #if SD_SUPPORTED
+              delete reinterpret_cast<EngineHandle*>(handle);
+          #else
+              (void)handle;
+          #endif
+          }
+
+          }  // extern "C"
+          SD_EOF_JNI
+          mkdir -p "$(dirname 'realesrgan/core/diffusion/diffusion.cmake')"
+          cat > 'realesrgan/core/diffusion/diffusion.cmake' <<'SD_EOF_CMAKE'
+          # =============================================================================
+          # Integração do Stable Diffusion (MNN-Diffusion) no SuperImage
+          #
+          # O QUE EDITAR NOS ARQUIVOS EXISTENTES
+          #
+          # 1) Trocar o submódulo MNN (fork antigo) pelo MNN oficial, que tem o módulo de difusão:
+          #      git submodule deinit -f realesrgan/core/MNN
+          #      git rm -f realesrgan/core/MNN
+          #      git submodule add https://github.com/alibaba/MNN realesrgan/core/MNN
+          #
+          # 2) Em realesrgan/core/CMakeLists.txt, ANTES da linha add_subdirectory(.../MNN), adicionar:
+          #      include(${CMAKE_CURRENT_SOURCE_DIR}/diffusion/diffusion.cmake)
+          #
+          # 3) Em realesrgan/android/build.gradle, na lista targets, acrescentar "sdjni":
+          #      targets "realesrgan", "MNN", "MNN_VK", "MNN_CL", "sdjni"
+          #
+          # 4) Em realesrgan/android/proguard-rules.pro, acrescentar:
+          #      -keep class com.zhenxiang.realesrgan.DiffusionEngine { native <methods>; }
+          #      -keep interface com.zhenxiang.realesrgan.DiffusionEngine$ProgressListener { *; }
+          #
+          # Observação: o Stable Diffusion só é compilado de verdade em arm64-v8a.
+          # Em armeabi-v7a a biblioteca sdjni existe, mas devolve "não suportado".
+          # =============================================================================
+
+          if(ANDROID AND ANDROID_ABI STREQUAL "arm64-v8a")
+              # Mesmas opções do README do MNN-Diffusion
+              set(MNN_BUILD_DIFFUSION ON CACHE BOOL "" FORCE)
+              set(MNN_BUILD_LLM ON CACHE BOOL "" FORCE)
+              set(MNN_BUILD_LLM_OMNI ON CACHE BOOL "" FORCE)
+              set(MNN_IMGCODECS ON CACHE BOOL "" FORCE)
+          endif()
+
+          add_library(sdjni SHARED ${CMAKE_CURRENT_LIST_DIR}/diffusion_jni.cpp)
+          target_link_libraries(sdjni log)
+
+          if(ANDROID AND ANDROID_ABI STREQUAL "arm64-v8a")
+              target_include_directories(sdjni PRIVATE
+                  ${CMAKE_CURRENT_SOURCE_DIR}/MNN/include
+                  ${CMAKE_CURRENT_SOURCE_DIR}/MNN/transformers/diffusion/engine/include)
+              # "diffusion" já puxa MNN, MNN_Express e o motor LLM (tokenizer) como dependências
+              target_link_libraries(sdjni MNN diffusion)
+          endif()
+          SD_EOF_CMAKE
+          mkdir -p "$(dirname 'realesrgan/android/src/main/java/com/zhenxiang/realesrgan/DiffusionEngine.kt')"
+          cat > 'realesrgan/android/src/main/java/com/zhenxiang/realesrgan/DiffusionEngine.kt' <<'SD_EOF_ENGINE'
+          package com.zhenxiang.realesrgan
+
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import kotlinx.coroutines.asCoroutineDispatcher
+          import kotlinx.coroutines.withContext
+          import java.io.File
+          import java.util.concurrent.Executors
+
+          /**
+           * Geração de imagem (texto -> imagem) com Stable Diffusion 1.5 rodando localmente via MNN.
+           *
+           * Pasta do modelo (modelDir) precisa conter:
+           *   text_encoder.mnn, unet.mnn, vae_decoder.mnn (cada um com seu .weight, se houver) e tokenizer.mtok
+           *
+           * Limitações desta primeira versão:
+           *  - só texto -> imagem, 512x512 (img2img/inpainting ficam para a fase 2);
+           *  - sem prompt negativo, guidance fixo em 7.5 (definido no motor do MNN);
+           *  - a geração não pode ser cancelada no meio (o motor nativo não expõe isso);
+           *  - onProgress é chamado numa thread de segundo plano, não na thread principal.
+           *
+           * Regras do ProGuard necessárias (release com minify):
+           *   -keep class com.zhenxiang.realesrgan.DiffusionEngine { native <methods>; }
+           *   -keep interface com.zhenxiang.realesrgan.DiffusionEngine$ProgressListener { *; }
+           */
+          class DiffusionEngine(
+              private val modelDir: File,
+              private val cacheDir: File,
+              private val backend: Backend = Backend.CPU,
+              private val memoryMode: MemoryMode = MemoryMode.SAVE_MEMORY,
+          ) : AutoCloseable {
+
+              enum class Backend(internal val code: Int) { CPU(0), OPENCL(3) }
+
+              enum class MemoryMode(internal val code: Int) { SAVE_MEMORY(0), FAST(1), BALANCED(2) }
+
+              fun interface ProgressListener {
+                  fun onProgress(percent: Int)
+              }
+
+              class GenerationException(message: String) : Exception(message)
+
+              // O motor do MNN usa um executor global: todas as chamadas nativas ficam numa única thread.
+              private val executor = Executors.newSingleThreadExecutor()
+              private val dispatcher = executor.asCoroutineDispatcher()
+              private var handle: Long = 0L
+
+              suspend fun generate(
+                  prompt: String,
+                  steps: Int = 20,
+                  seed: Int = -1,
+                  onProgress: (Int) -> Unit = {},
+              ): Bitmap = withContext(dispatcher) {
+                  if (!isSupported) {
+                      throw GenerationException("Stable Diffusion só funciona em aparelhos arm64 (64 bits).")
+                  }
+                  val missing = REQUIRED_FILES.filterNot { File(modelDir, it).exists() }
+                  if (missing.isNotEmpty()) {
+                      throw GenerationException("Arquivos do modelo ausentes em $modelDir: ${missing.joinToString()}")
+                  }
+                  if (prompt.isBlank()) throw GenerationException("O prompt está vazio.")
+
+                  if (handle == 0L) {
+                      handle = nativeCreate(modelDir.absolutePath, backend.code, memoryMode.code)
+                      if (handle == 0L) throw GenerationException("Não foi possível criar o motor de difusão.")
+                  }
+
+                  val output = File.createTempFile("sd_", ".jpg", cacheDir)
+                  try {
+                      val code = nativeGenerate(
+                          handle,
+                          prompt,
+                          output.absolutePath,
+                          steps.coerceIn(1, 50),
+                          seed,
+                          ProgressListener { percent -> onProgress(percent) },
+                      )
+                      if (code != 0) throw GenerationException(errorMessage(code))
+                      BitmapFactory.decodeFile(output.absolutePath)
+                          ?: throw GenerationException("O motor terminou, mas a imagem não foi gerada.")
+                  } finally {
+                      output.delete()
+                  }
+              }
+
+              override fun close() {
+                  executor.execute {
+                      if (handle != 0L) {
+                          nativeRelease(handle)
+                          handle = 0L
+                      }
+                  }
+                  executor.shutdown()
+              }
+
+              private fun errorMessage(code: Int): String = when (code) {
+                  1 -> "Motor de difusão inválido."
+                  2 -> "Falha ao carregar o modelo (confira os arquivos e a memória disponível)."
+                  3 -> "A geração falhou."
+                  4 -> "Erro interno no motor de difusão."
+                  5 -> "Aparelho não suportado (precisa de arm64)."
+                  else -> "Erro desconhecido ($code)."
+              }
+
+              private external fun nativeCreate(modelDir: String, backend: Int, memoryMode: Int): Long
+
+              private external fun nativeGenerate(
+                  handle: Long,
+                  prompt: String,
+                  outputPath: String,
+                  steps: Int,
+                  seed: Int,
+                  listener: ProgressListener?,
+              ): Int
+
+              private external fun nativeRelease(handle: Long)
+
+              companion object {
+                  private val REQUIRED_FILES = listOf("text_encoder.mnn", "unet.mnn", "vae_decoder.mnn", "tokenizer.mtok")
+
+                  /** false em aparelhos de 32 bits ou se as bibliotecas nativas não foram empacotadas. */
+                  val isSupported: Boolean = try {
+                      System.loadLibrary("MNN")
+                      try {
+                          System.loadLibrary("MNN_CL")
+                      } catch (e: UnsatisfiedLinkError) {
+                          // sem OpenCL: o backend de CPU continua funcionando
+                      }
+                      System.loadLibrary("sdjni")
+                      android.os.Build.SUPPORTED_64_BIT_ABIS.isNotEmpty()
+                  } catch (e: UnsatisfiedLinkError) {
+                      false
+                  }
+              }
+          }
+          SD_EOF_ENGINE
+          mkdir -p "$(dirname 'app/src/main/java/com/zhenxiang/superimage/GenerateActivity.kt')"
+          cat > 'app/src/main/java/com/zhenxiang/superimage/GenerateActivity.kt' <<'SD_EOF_ACTIVITY'
+          package com.zhenxiang.superimage
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.ContentValues
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Bitmap
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.MediaStore
+          import android.text.InputType
+          import android.view.ViewGroup
+          import android.view.WindowManager
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.ProgressBar
+          import android.widget.RadioButton
+          import android.widget.RadioGroup
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import com.zhenxiang.realesrgan.DiffusionEngine
+          import kotlinx.coroutines.CoroutineScope
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.SupervisorJob
+          import kotlinx.coroutines.cancel
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import org.json.JSONObject
+          import java.io.File
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          /**
+           * Tela simples (views criadas por código) para gerar imagens com Stable Diffusion local.
+           * Baixa o modelo do Hugging Face na primeira vez e depois funciona offline.
+           */
+          class GenerateActivity : Activity() {
+
+              private enum class Variant(
+                  val label: String,
+                  val repo: String,
+                  val folder: String,
+                  val backend: DiffusionEngine.Backend,
+              ) {
+                  CPU(
+                      "CPU (mais compatível)",
+                      "taobao-mnn/stable-diffusion-v1-5-mnn-general",
+                      "sd15_general",
+                      DiffusionEngine.Backend.CPU,
+                  ),
+                  GPU(
+                      "GPU / OpenCL (mais rápido, pode falhar)",
+                      "taobao-mnn/stable-diffusion-v1-5-mnn-gpu",
+                      "sd15_gpu",
+                      DiffusionEngine.Backend.OPENCL,
+                  ),
+              }
+
+              private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+              private var engine: DiffusionEngine? = null
+              private var engineVariant: Variant? = null
+              private var lastBitmap: Bitmap? = null
+              private var busy = false
+
+              private lateinit var statusText: TextView
+              private lateinit var variantGroup: RadioGroup
+              private lateinit var downloadButton: Button
+              private lateinit var promptInput: EditText
+              private lateinit var stepsInput: EditText
+              private lateinit var seedInput: EditText
+              private lateinit var generateButton: Button
+              private lateinit var progressBar: ProgressBar
+              private lateinit var resultView: ImageView
+              private lateinit var saveButton: Button
+              private lateinit var upscaleButton: Button
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  title = "SuperImage Gerar"
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(dp(16), dp(16), dp(16), dp(16))
+
+                  statusText = TextView(this)
+                  statusText.textSize = 15f
+                  root.addView(statusText)
+
+                  variantGroup = RadioGroup(this)
+                  Variant.values().forEachIndexed { index, variant ->
+                      val radio = RadioButton(this)
+                      radio.id = index + 1
+                      radio.text = variant.label
+                      radio.isChecked = index == 0
+                      variantGroup.addView(radio)
+                  }
+                  variantGroup.setOnCheckedChangeListener { _, _ -> refreshStatus() }
+                  root.addView(variantGroup)
+
+                  downloadButton = makeButton("Baixar modelo (1 a 2 GB)") { onDownload() }
+                  root.addView(downloadButton)
+
+                  promptInput = EditText(this)
+                  promptInput.hint = "Descreva a imagem (em inglês funciona melhor)"
+                  promptInput.minLines = 2
+                  promptInput.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+                  root.addView(promptInput)
+
+                  stepsInput = EditText(this)
+                  stepsInput.hint = "Passos (1 a 50)"
+                  stepsInput.inputType = InputType.TYPE_CLASS_NUMBER
+                  stepsInput.setText("20")
+                  root.addView(stepsInput)
+
+                  seedInput = EditText(this)
+                  seedInput.hint = "Seed (-1 = aleatória)"
+                  seedInput.inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_SIGNED
+                  seedInput.setText("-1")
+                  root.addView(seedInput)
+
+                  generateButton = makeButton("Gerar imagem") { onGenerate() }
+                  root.addView(generateButton)
+
+                  progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+                  progressBar.max = 100
+                  root.addView(progressBar)
+
+                  resultView = ImageView(this)
+                  resultView.adjustViewBounds = true
+                  resultView.scaleType = ImageView.ScaleType.FIT_CENTER
+                  root.addView(
+                      resultView,
+                      LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT),
+                  )
+
+                  saveButton = makeButton("Salvar na galeria") { onSave() }
+                  saveButton.isEnabled = false
+                  root.addView(saveButton)
+
+                  upscaleButton = makeButton("Aumentar resolução (abre o upscaler)") { onUpscale() }
+                  upscaleButton.isEnabled = false
+                  root.addView(upscaleButton)
+
+                  val scroll = ScrollView(this)
+                  scroll.addView(root)
+                  setContentView(scroll)
+
+                  refreshStatus()
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  scope.cancel()
+                  engine?.close()
+                  engine = null
+              }
+
+              private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+              private fun makeButton(label: String, onClick: () -> Unit): Button {
+                  val button = Button(this)
+                  button.text = label
+                  button.setOnClickListener { onClick() }
+                  return button
+              }
+
+              private fun selectedVariant(): Variant {
+                  val index = (variantGroup.checkedRadioButtonId - 1).coerceAtLeast(0)
+                  return Variant.values()[index]
+              }
+
+              private fun modelDir(variant: Variant): File = File(filesDir, "sd/${variant.folder}")
+
+              private fun modelReady(variant: Variant): Boolean {
+                  val dir = modelDir(variant)
+                  return listOf("text_encoder.mnn", "unet.mnn", "vae_decoder.mnn", "tokenizer.mtok")
+                      .all { File(dir, it).exists() }
+              }
+
+              private fun refreshStatus() {
+                  statusText.text = when {
+                      !DiffusionEngine.isSupported ->
+                          "Este aparelho não é compatível (precisa de 64 bits) ou as bibliotecas não foram incluídas no app."
+                      modelReady(selectedVariant()) -> "Modelo pronto. Escreva o prompt e toque em Gerar."
+                      else -> "Modelo ainda não baixado. Toque em Baixar modelo, de preferência no Wi-Fi."
+                  }
+              }
+
+              private fun setBusy(value: Boolean) {
+                  busy = value
+                  downloadButton.isEnabled = !value
+                  generateButton.isEnabled = !value
+                  if (value) {
+                      window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  } else {
+                      window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                  }
+              }
+
+              private fun postStatus(text: String) {
+                  runOnUiThread { statusText.text = text }
+              }
+
+              // ---------------------------------------------------------------- download
+
+              private fun onDownload() {
+                  if (busy) return
+                  val variant = selectedVariant()
+                  setBusy(true)
+                  progressBar.progress = 0
+                  scope.launch {
+                      try {
+                          withContext(Dispatchers.IO) { downloadModel(variant) }
+                          statusText.text = if (modelReady(variant)) {
+                              "Download concluído. Já pode gerar imagens."
+                          } else {
+                              "O download terminou, mas faltam arquivos (o repositório precisa ter tokenizer.mtok)."
+                          }
+                      } catch (e: Exception) {
+                          statusText.text = "Falha no download: ${e.message}"
+                      } finally {
+                          setBusy(false)
+                      }
+                  }
+              }
+
+              private fun downloadModel(variant: Variant) {
+                  val dir = modelDir(variant)
+                  dir.mkdirs()
+                  postStatus("Consultando a lista de arquivos...")
+                  val files = listRepoFiles(variant.repo)
+                  if (files.isEmpty()) throw IllegalStateException("nenhum arquivo de modelo encontrado")
+
+                  val total = files.fold(0L) { acc, file -> acc + maxOf(file.second, 0L) }.coerceAtLeast(1L)
+                  var done = 0L
+                  var lastPercent = -1
+                  for ((name, size) in files) {
+                      postStatus("Baixando $name...")
+                      downloadFile(variant.repo, name, size, dir) { delta ->
+                          done += delta
+                          val percent = (done * 100 / total).toInt().coerceIn(0, 100)
+                          if (percent != lastPercent) {
+                              lastPercent = percent
+                              runOnUiThread { progressBar.progress = percent }
+                          }
+                      }
+                  }
+              }
+
+              private fun listRepoFiles(repo: String): List<Pair<String, Long>> {
+                  val connection = URL("https://huggingface.co/api/models/$repo?blobs=true").openConnection() as HttpURLConnection
+                  connection.connectTimeout = 20000
+                  connection.readTimeout = 30000
+                  try {
+                      if (connection.responseCode != 200) {
+                          throw IllegalStateException("HTTP ${connection.responseCode} ao listar $repo")
+                      }
+                      val json = JSONObject(connection.inputStream.bufferedReader().use { it.readText() })
+                      val siblings = json.getJSONArray("siblings")
+                      val result = ArrayList<Pair<String, Long>>()
+                      for (i in 0 until siblings.length()) {
+                          val item = siblings.getJSONObject(i)
+                          val name = item.getString("rfilename")
+                          if (name.contains('/')) continue
+                          if (name.endsWith(".mnn") || name.endsWith(".weight") || name.endsWith(".mtok")) {
+                              result.add(Pair(name, item.optLong("size", -1L)))
+                          }
+                      }
+                      return result
+                  } finally {
+                      connection.disconnect()
+                  }
+              }
+
+              private fun downloadFile(repo: String, name: String, size: Long, dir: File, onBytes: (Long) -> Unit) {
+                  val target = File(dir, name)
+                  if (size > 0 && target.exists() && target.length() == size) {
+                      onBytes(size)
+                      return
+                  }
+                  val part = File(dir, "$name.part")
+                  val connection = URL("https://huggingface.co/$repo/resolve/main/$name").openConnection() as HttpURLConnection
+                  connection.connectTimeout = 20000
+                  connection.readTimeout = 30000
+                  connection.instanceFollowRedirects = true
+                  try {
+                      if (connection.responseCode != 200) {
+                          throw IllegalStateException("HTTP ${connection.responseCode} em $name")
+                      }
+                      connection.inputStream.use { input ->
+                          part.outputStream().use { output ->
+                              val buffer = ByteArray(256 * 1024)
+                              while (true) {
+                                  val read = input.read(buffer)
+                                  if (read < 0) break
+                                  output.write(buffer, 0, read)
+                                  onBytes(read.toLong())
+                              }
+                          }
+                      }
+                      if (target.exists()) target.delete()
+                      if (!part.renameTo(target)) throw IllegalStateException("não foi possível salvar $name")
+                  } finally {
+                      connection.disconnect()
+                  }
+              }
+
+              // ---------------------------------------------------------------- geração
+
+              private fun obtainEngine(variant: Variant): DiffusionEngine {
+                  val current = engine
+                  if (current != null && engineVariant == variant) return current
+                  current?.close()
+                  val created = DiffusionEngine(
+                      modelDir(variant),
+                      cacheDir,
+                      variant.backend,
+                      DiffusionEngine.MemoryMode.SAVE_MEMORY,
+                  )
+                  engine = created
+                  engineVariant = variant
+                  return created
+              }
+
+              private fun onGenerate() {
+                  if (busy) return
+                  val prompt = promptInput.text.toString().trim()
+                  if (prompt.isEmpty()) {
+                      Toast.makeText(this, "Escreva um prompt primeiro.", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  val variant = selectedVariant()
+                  if (!DiffusionEngine.isSupported || !modelReady(variant)) {
+                      refreshStatus()
+                      return
+                  }
+                  val steps = stepsInput.text.toString().toIntOrNull() ?: 20
+                  val seed = seedInput.text.toString().toIntOrNull() ?: -1
+
+                  setBusy(true)
+                  progressBar.progress = 0
+                  statusText.text = "Carregando o modelo (pode demorar na primeira vez)..."
+                  scope.launch {
+                      try {
+                          val bitmap = obtainEngine(variant).generate(prompt, steps, seed) { percent ->
+                              runOnUiThread {
+                                  progressBar.progress = percent
+                                  statusText.text = "Gerando... $percent%"
+                              }
+                          }
+                          lastBitmap = bitmap
+                          resultView.setImageBitmap(bitmap)
+                          saveButton.isEnabled = true
+                          upscaleButton.isEnabled = true
+                          statusText.text = "Pronto!"
+                      } catch (e: Exception) {
+                          statusText.text = "Erro: ${e.message}"
+                      } finally {
+                          setBusy(false)
+                      }
+                  }
+              }
+
+              // ---------------------------------------------------------------- salvar / upscale
+
+              private fun saveToGallery(): Uri? {
+                  val bitmap = lastBitmap ?: return null
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
+                      checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE), 1)
+                      Toast.makeText(this, "Permita o acesso ao armazenamento e toque de novo.", Toast.LENGTH_LONG).show()
+                      return null
+                  }
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                      val values = ContentValues()
+                      values.put(MediaStore.Images.Media.DISPLAY_NAME, "sd_${System.currentTimeMillis()}.png")
+                      values.put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                      values.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/SuperImageGerar")
+                      values.put(MediaStore.Images.Media.IS_PENDING, 1)
+                      val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values) ?: return null
+                      contentResolver.openOutputStream(uri)?.use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                      values.clear()
+                      values.put(MediaStore.Images.Media.IS_PENDING, 0)
+                      contentResolver.update(uri, values, null, null)
+                      return uri
+                  }
+                  @Suppress("DEPRECATION")
+                  val path = MediaStore.Images.Media.insertImage(
+                      contentResolver,
+                      bitmap,
+                      "sd_${System.currentTimeMillis()}",
+                      "Gerada com SuperImage Gerar",
+                  )
+                  return if (path != null) Uri.parse(path) else null
+              }
+
+              private fun onSave() {
+                  val uri = saveToGallery()
+                  if (uri != null) Toast.makeText(this, "Salva na galeria.", Toast.LENGTH_SHORT).show()
+              }
+
+              private fun onUpscale() {
+                  val uri = saveToGallery() ?: return
+                  val send = Intent(Intent.ACTION_SEND)
+                  send.setClass(this, IntentActivity::class.java)
+                  send.type = "image/*"
+                  send.putExtra(Intent.EXTRA_STREAM, uri)
+                  send.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                  startActivity(send)
+              }
+          }
+          SD_EOF_ACTIVITY
+          mkdir -p "$(dirname '/tmp/patch_project.py')"
+          cat > '/tmp/patch_project.py' <<'SD_EOF_PATCH'
+          import pathlib
+          import sys
+
+
+          def read(path):
+              return pathlib.Path(path).read_text(encoding="utf-8")
+
+
+          def write(path, text):
+              pathlib.Path(path).write_text(text, encoding="utf-8")
+
+
+          def replace_once(path, old, new):
+              text = read(path)
+              if old not in text:
+                  sys.exit("ERRO: trecho nao encontrado em %s:\n%s" % (path, old))
+              write(path, text.replace(old, new, 1))
+              print("ok:", path)
+
+
+          # 1) CMake: incluir a integracao antes de compilar o MNN
+          replace_once(
+              "realesrgan/core/CMakeLists.txt",
+              "add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/MNN)",
+              "include(${CMAKE_CURRENT_SOURCE_DIR}/diffusion/diffusion.cmake)\n"
+              "add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/MNN)",
+          )
+
+          # 2) Gradle do modulo realesrgan: novo alvo nativo e NDK fixo
+          replace_once(
+              "realesrgan/android/build.gradle",
+              'targets "realesrgan", "MNN", "MNN_VK", "MNN_CL"',
+              'targets "realesrgan", "MNN", "MNN_VK", "MNN_CL", "sdjni"',
+          )
+          replace_once(
+              "realesrgan/android/build.gradle",
+              "compileSdk 33\n",
+              "compileSdk 33\n    ndkVersion '25.2.9519653'\n",
+          )
+
+          # 3) ProGuard: manter a ponte JNI
+          with open("realesrgan/android/proguard-rules.pro", "a", encoding="utf-8") as f:
+              f.write(
+                  "\n-keep class com.zhenxiang.realesrgan.DiffusionEngine { native <methods>; }\n"
+                  "-keep interface com.zhenxiang.realesrgan.DiffusionEngine$ProgressListener { *; }\n"
+              )
+          print("ok: proguard")
+
+          # 4) Manifest do app: permissao de internet (download do modelo) e a nova tela
+          manifest = "app/src/main/AndroidManifest.xml"
+          replace_once(
+              manifest,
+              '<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />',
+              '<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />\n'
+              '    <uses-permission android:name="android.permission.INTERNET" />',
+          )
+          replace_once(
+              manifest,
+              "</application>",
+              '<activity\n'
+              '            android:name=".GenerateActivity"\n'
+              '            android:exported="true"\n'
+              '            android:label="SuperImage Gerar"\n'
+              '            android:theme="@android:style/Theme.Material.Light">\n'
+              '            <intent-filter>\n'
+              '                <action android:name="android.intent.action.MAIN" />\n'
+              '                <category android:name="android.intent.category.LAUNCHER" />\n'
+              '            </intent-filter>\n'
+              '        </activity>\n'
+              '    </application>',
+          )
+          SD_EOF_PATCH
+          python3 /tmp/patch_project.py
+
+      - name: Instalar JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 11
+
+      - name: Instalar NDK e CMake
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "cmake;3.22.1" "ndk;25.2.9519653"
+
+      - name: Compilar o APK
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleFreeDebug --no-daemon --stacktrace 2>&1 | tee build.log
+
+      - name: Resumo dos erros
+        if: failure()
+        run: |
+          {
+            echo '## Erros do build'
+            echo '```'
+            grep -n -E "error:|Error|FAILED|What went wrong|undefined reference" build.log | head -60
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Guardar o log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - name: Guardar o APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: superimage-sd-apk
+          path: app/build/outputs/apk/free/debug/*.apk
+
+      - name: Publicar o APK em Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sd-build-${{ github.run_number }}
+          name: SuperImage SD build ${{ github.run_number }}
+          prerelease: true
+          files: app/build/outputs/apk/free/debug/*.apk
