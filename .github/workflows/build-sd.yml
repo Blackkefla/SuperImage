@@ -865,17 +865,20 @@ jobs:
           SD_EOF_PATCH
           python3 /tmp/patch_project.py
 
+      - name: Instalar NDK e CMake (sdkmanager precisa de Java 17)
+        run: |
+          export JAVA_HOME="${JAVA_HOME_17_X64:-$JAVA_HOME}"
+          export PATH="$JAVA_HOME/bin:$PATH"
+          java -version
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "cmake;3.22.1" "ndk;25.2.9519653"
+
       - name: Instalar JDK
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 11
-
-      - name: Instalar NDK e CMake
-        run: |
-          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          yes | "$SDKM" --licenses > /dev/null || true
-          "$SDKM" "cmake;3.22.1" "ndk;25.2.9519653"
 
       - name: Compilar o APK
         run: |
