@@ -218,6 +218,9 @@ jobs:
               set(MNN_BUILD_LLM ON CACHE BOOL "" FORCE)
               set(MNN_BUILD_LLM_OMNI ON CACHE BOOL "" FORCE)
               set(MNN_IMGCODECS ON CACHE BOOL "" FORCE)
+              # O backend ARM82 (fp16) do MNN novo nao compila com o NDK 25:
+              # falta std::sqrt e as instrucoes vfmlalq_*_f16. Desligado por enquanto.
+              set(MNN_ARM82 OFF CACHE BOOL "" FORCE)
           endif()
 
           add_library(sdjni SHARED ${CMAKE_CURRENT_LIST_DIR}/diffusion_jni.cpp)
