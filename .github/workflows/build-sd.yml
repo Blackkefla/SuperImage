@@ -820,10 +820,22 @@ jobs:
           )
 
           # 2) Gradle do modulo realesrgan: novo alvo nativo e NDK fixo
+          # No MNN oficial o backend Vulkan se chama MNN_Vulkan (o fork antigo usava MNN_VK)
           replace_once(
               "realesrgan/android/build.gradle",
               'targets "realesrgan", "MNN", "MNN_VK", "MNN_CL"',
-              'targets "realesrgan", "MNN", "MNN_VK", "MNN_CL", "sdjni"',
+              'targets "realesrgan", "MNN", "MNN_Vulkan", "MNN_CL", "sdjni"',
+          )
+          replace_once(
+              "realesrgan/android/src/main/java/com/zhenxiang/realesrgan/RealESRGAN.kt",
+              '            System.loadLibrary("MNN_VK")\n            System.loadLibrary("MNN_CL")\n',
+              '            for (backend in listOf("MNN_Vulkan", "MNN_CL")) {\n'
+              '                try {\n'
+              '                    System.loadLibrary(backend)\n'
+              '                } catch (e: UnsatisfiedLinkError) {\n'
+              '                    // backend opcional: o upscale continua funcionando na CPU\n'
+              '                }\n'
+              '            }\n',
           )
           replace_once(
               "realesrgan/android/build.gradle",
@@ -882,6 +894,7 @@ jobs:
 
       - name: Compilar o APK
         run: |
+          set -o pipefail
           chmod +x gradlew
           ./gradlew assembleFreeDebug --no-daemon --stacktrace 2>&1 | tee build.log
 
@@ -892,7 +905,9 @@ jobs:
             echo '## Erros do build'
             if [ -f build.log ]; then
               echo '```'
-              grep -n -E "error:|Error|FAILED|What went wrong|undefined reference" build.log | head -60 || true
+              grep -n -A25 "What went wrong" build.log | head -70 || true
+              echo '--- erros do compilador ---'
+              grep -n -E "error:|undefined reference|fatal error" build.log | head -40 || true
               echo '```'
             else
               echo 'O build falhou ANTES do Gradle. Abra o job build e veja qual passo ficou com X vermelho.'
@@ -912,6 +927,7 @@ jobs:
         with:
           name: superimage-sd-apk
           path: app/build/outputs/apk/free/debug/*.apk
+          if-no-files-found: error
 
       - name: Publicar o APK em Releases
         uses: softprops/action-gh-release@v2
