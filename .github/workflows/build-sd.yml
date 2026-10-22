@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - name: Baixar o codigo
@@ -887,9 +887,13 @@ jobs:
         run: |
           {
             echo '## Erros do build'
-            echo '```'
-            grep -n -E "error:|Error|FAILED|What went wrong|undefined reference" build.log | head -60
-            echo '```'
+            if [ -f build.log ]; then
+              echo '```'
+              grep -n -E "error:|Error|FAILED|What went wrong|undefined reference" build.log | head -60 || true
+              echo '```'
+            else
+              echo 'O build falhou ANTES do Gradle. Abra o job build e veja qual passo ficou com X vermelho.'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Guardar o log
